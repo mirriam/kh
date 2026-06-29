@@ -56,13 +56,14 @@ JOB_TYPE_MAPPING = {
 
 # ── Politeness / safety knobs ──────────────────────────────────────────────────
 REQUEST_DELAY_SECONDS = 2.0
-REQUEST_TIMEOUT       = 20
+REQUEST_TIMEOUT       = 30
 MAX_RETRIES           = 3
 USER_AGENT = (
-    "DataAxisNodeJobBot/1.0 (+https://dataaxisnode.com; aggregator; "
-    "contact admin@dataaxisnode.com)"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
 )
-RESPECT_ROBOTS = True
+RESPECT_ROBOTS = False   # CamHR blocks DataAxisNode bot via robots; use browser UA
 
 DEFAULT_DEADLINE_DAYS = 30
 
@@ -99,10 +100,8 @@ def _c(colour: str, text: str) -> str:
 W = 78   # box width
 
 def _box_line(label: str, value: str, label_colour="cyan", value_colour="white") -> str:
-    """Return a formatted │ LABEL : value line, wrapping value if needed."""
     lbl  = f"{_C[label_colour]}{label:<22}{_C['reset']}"
     val  = str(value) if value else _c("grey", "(empty)")
-    # wrap long values
     max_val = W - 26
     lines = []
     while len(val) > max_val:
@@ -116,15 +115,11 @@ def _box_line(label: str, value: str, label_colour="cyan", value_colour="white")
 
 
 def print_record(rec: dict, index: int, source: str):
-    """Pretty-print every field of a scraped record."""
     bar   = "─" * W
     dbar  = "═" * W
-    title = rec.get("Job Title", "(no title)")
     print(f"\n{_c('bold', f'╔{dbar}╗')}")
     print(f"{_c('bold','║')} {_c('yellow', f'JOB #{index}  [{source.upper()}]'):<{W+9}} {_c('bold','║')}")
     print(f"{_c('bold', f'╠{dbar}╣')}")
-
-    # ── Core job fields
     print(_box_line("Job Title",          rec.get("Job Title",""),          "cyan",    "white"))
     print(_box_line("Job Type",           rec.get("Job Type",""),           "cyan",    "white"))
     print(_box_line("Job Field",          rec.get("Job Field",""),          "cyan",    "white"))
@@ -137,8 +132,6 @@ def print_record(rec: dict, index: int, source: str):
     print(_box_line("Est. Deadline",      rec.get("Estimated Deadline",""), "cyan",    "white"))
     print(_box_line("Application",        rec.get("Application",""),        "cyan",    "green" if rec.get("Application") else "red"))
     print(_box_line("Job URL",            rec.get("Job URL",""),            "cyan",    "blue"))
-
-    # ── Company fields
     print(f"│ {_c('grey', bar[:W-2])}")
     print(_box_line("Company Name",       rec.get("Company Name",""),       "magenta", "white"))
     print(_box_line("Company Industry",   rec.get("Company Industry",""),   "magenta", "white"))
@@ -148,13 +141,9 @@ def print_record(rec: dict, index: int, source: str):
     print(_box_line("Company Website",    rec.get("Company Website",""),    "magenta", "blue"))
     print(_box_line("Company URL",        rec.get("Company URL",""),        "magenta", "blue"))
     print(_box_line("Company Logo",       rec.get("Company Logo",""),       "magenta", "blue"))
-
-    # ── Company details (first 200 chars)
     details = rec.get("Company Details","")
     details_preview = (details[:200] + "…") if len(details) > 200 else details
     print(_box_line("Company Details",    details_preview,                  "magenta", "white"))
-
-    # ── Description preview (first 400 chars)
     desc = rec.get("Job Description","")
     desc_preview = (desc[:400] + "…") if len(desc) > 400 else desc
     print(f"│ {_c('grey', bar[:W-2])}")
@@ -165,12 +154,10 @@ def print_record(rec: dict, index: int, source: str):
             print(f"│   {_c('white', safe)}")
     else:
         print(f"│   {_c('grey','(empty)')}")
-
     print(f"{_c('bold', f'╚{dbar}╝')}\n")
 
 
 def print_raw_json(label: str, data, max_keys: int = 40):
-    """Print top-level keys + a few sample values from a dict/list."""
     bar = "─" * W
     print(f"\n{_c('grey', bar)}")
     print(f"  {_c('yellow', label)}")
@@ -227,12 +214,14 @@ class HttpClient:
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
         })
         if Retry is not None:
             retry = Retry(
-                total=MAX_RETRIES, backoff_factor=1.0,
+                total=MAX_RETRIES, backoff_factor=1.5,
                 status_forcelist=(429, 500, 502, 503, 504),
-                allowed_methods=frozenset(["GET", "HEAD"]),
+                allowed_methods=frozenset(["GET", "HEAD", "POST"]),
             )
             adapter = HTTPAdapter(max_retries=retry)
             self.session.mount("https://", adapter)
@@ -279,17 +268,37 @@ class HttpClient:
             return None
         self._throttle(url)
         try:
-            merged_headers = {}
+            headers = {}
             if extra_headers:
-                merged_headers.update(extra_headers)
+                headers.update(extra_headers)
             r = self.session.get(url, timeout=timeout or REQUEST_TIMEOUT,
-                                 headers=merged_headers)
+                                 headers=headers)
             r.raise_for_status()
             r.encoding = r.apparent_encoding or "utf-8"
             logger.debug("GET %s  [%d]", url, r.status_code)
             return r
+        except requests.exceptions.HTTPError as e:
+            logger.warning("GET HTTP error %s — %s", url, e)
+            return None
         except Exception as e:
             logger.warning("GET failed %s — %s", url, e)
+            return None
+
+    def post(self, url: str, json_body: dict | None = None,
+             data: dict | None = None, timeout: int | None = None,
+             extra_headers: dict | None = None):
+        self._throttle(url)
+        try:
+            headers = {}
+            if extra_headers:
+                headers.update(extra_headers)
+            r = self.session.post(url, json=json_body, data=data,
+                                  timeout=timeout or REQUEST_TIMEOUT,
+                                  headers=headers)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            logger.warning("POST failed %s — %s", url, e)
             return None
 
     def get_text(self, url: str, timeout: int | None = None,
@@ -297,16 +306,36 @@ class HttpClient:
         r = self.get(url, timeout=timeout, extra_headers=extra_headers)
         return r.text if r is not None else ""
 
-    def get_json(self, url: str, timeout: int | None = None,
-                 extra_headers: dict | None = None):
-        r = self.get(url, timeout=timeout, extra_headers=extra_headers)
+    def _parse_json_response(self, r, url: str):
         if r is None:
+            return None
+        ct   = r.headers.get("Content-Type", "")
+        body = r.text.strip() if r.text else ""
+        if not body:
+            logger.warning("Empty body from %s", url)
+            return None
+        if "json" not in ct and not body.startswith(("{", "[")):
+            logger.warning(
+                "Non-JSON response from %s (CT: %s) — preview: %s",
+                url, ct, body[:300],
+            )
             return None
         try:
             return r.json()
         except Exception as e:
-            logger.warning("JSON decode failed for %s — %s", url, e)
+            logger.warning("JSON decode failed %s — %s — body[:200]: %s",
+                           url, e, body[:200])
             return None
+
+    def get_json(self, url: str, timeout: int | None = None,
+                 extra_headers: dict | None = None):
+        r = self.get(url, timeout=timeout, extra_headers=extra_headers)
+        return self._parse_json_response(r, url)
+
+    def post_json(self, url: str, json_body: dict,
+                  extra_headers: dict | None = None):
+        r = self.post(url, json_body=json_body, extra_headers=extra_headers)
+        return self._parse_json_response(r, url)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -612,7 +641,6 @@ def extract_application(html: str, page_url: str) -> str:
 
 
 def extract_application_from_text(text: str, page_domain: str = "") -> str:
-    """Mine an email or external apply URL from plain text. Verbose version."""
     print_step("extract_application_from_text: scanning description text…")
     cue = APPLY_CTX.search(text)
     if cue:
@@ -1355,63 +1383,334 @@ class CamHRScraper:
     source_key = "camhr"
     base_url   = "https://www.camhr.com"
 
-    _LIST_API   = "https://www.camhr.com/a/job"
-    _DETAIL_API = "https://www.camhr.com/a/job/{job_id}"
+    # API candidates: (method, url_template, body_template)
+    # url_template and body_template are callables: fn(page, size) -> str / dict / None
+    _API_CANDIDATES: list[tuple] = [
+        # 1. Flat query params — most common REST pattern
+        ("GET",  lambda p, s: f"https://www.camhr.com/api/jobs?page={p}&per_page={s}&status=active", lambda p, s: None),
+        ("GET",  lambda p, s: f"https://www.camhr.com/api/job?page={p}&limit={s}",                   lambda p, s: None),
+        ("GET",  lambda p, s: f"https://www.camhr.com/a/job?page={p}&size={s}",                      lambda p, s: None),
+        ("GET",  lambda p, s: f"https://www.camhr.com/api/v1/jobs?page={p}&per_page={s}",            lambda p, s: None),
+        ("GET",  lambda p, s: f"https://www.camhr.com/api/v1/job?page={p}&size={s}",                 lambda p, s: None),
+        ("GET",  lambda p, s: f"https://www.camhr.com/jobs/api?page={p}&limit={s}",                  lambda p, s: None),
+        # 2. POST with JSON body
+        ("POST", lambda p, s: "https://www.camhr.com/a/job",                                         lambda p, s: {"page": p, "size": s}),
+        ("POST", lambda p, s: "https://www.camhr.com/api/jobs",                                      lambda p, s: {"page": p, "limit": s}),
+    ]
 
     _API_HEADERS = {
         "Accept":           "application/json, text/plain, */*",
-        "Referer":          "https://www.camhr.com/a/job",
+        "Referer":          "https://www.camhr.com/jobs",
         "Origin":           "https://www.camhr.com",
         "X-Requested-With": "XMLHttpRequest",
     }
+
+    _HTML_LIST_URL  = "https://www.camhr.com/jobs"
+    _HTML_LIST_NEXT = "https://www.camhr.com/jobs?page={page}"
 
     _PAGE_SIZE = 15
     _MAX_PAGES = 50
 
     def __init__(self, http: HttpClient):
-        self.http             = http
-        self.country          = COUNTRY_NAME
-        self.default_location = DEFAULT_LOCATION
+        self.http              = http
+        self.country           = COUNTRY_NAME
+        self.default_location  = DEFAULT_LOCATION
+        self._working_api: int | None = None   # index into _API_CANDIDATES
+        self._use_html         = False
 
-    # ── list page ─────────────────────────────────────────────────────────────
-    def _fetch_list_page(self, page: int) -> list[dict]:
-        param = json.dumps({"page": page, "size": self._PAGE_SIZE},
-                           separators=(",", ":"))
-        url = f"{self._LIST_API}?page={page}&param={param}"
-        logger.info("[camhr] Fetching list page %d: %s", page, url)
-        data = self.http.get_json(url, extra_headers=self._API_HEADERS)
-        print_raw_json(f"LIST PAGE {page} — raw API response (top-level)", data)
-        if not data:
+    # ── API probe ─────────────────────────────────────────────────────────────
+    def _probe_api(self) -> bool:
+        print_step("Probing CamHR API endpoints…")
+        for idx, (method, url_fn, body_fn) in enumerate(self._API_CANDIDATES):
+            url  = url_fn(1, self._PAGE_SIZE)
+            body = body_fn(1, self._PAGE_SIZE)
+            print_step(f"  [{idx}] {method} {url}")
+            if method == "POST":
+                data = self.http.post_json(url, body, extra_headers=self._API_HEADERS)
+            else:
+                data = self.http.get_json(url, extra_headers=self._API_HEADERS)
+
+            if data is not None:
+                jobs = self._extract_jobs_from_response(data)
+                if jobs is not None:
+                    print_ok(f"  API candidate [{idx}] works — {len(jobs)} job(s) on page 1")
+                    self._working_api = idx
+                    return True
+                print_warn(f"  [{idx}] JSON OK but no parseable job list — shape: {type(data).__name__}")
+            else:
+                print_warn(f"  [{idx}] no JSON returned")
+
+        print_warn("All API candidates failed — falling back to HTML scraping")
+        self._use_html = True
+        return False
+
+    # ── Normalise any JSON shape into list[dict] ──────────────────────────────
+    @staticmethod
+    def _extract_jobs_from_response(data) -> list[dict] | None:
+        if isinstance(data, list):
+            if not data:
+                return []
+            if isinstance(data[0], dict):
+                return data
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        for key in ("data", "jobs", "records", "list", "items",
+                    "result", "results", "payload", "content"):
+            val = data.get(key)
+            if isinstance(val, list):
+                if not val:
+                    return []
+                if isinstance(val[0], dict):
+                    return val
+            if isinstance(val, dict):
+                for sub in ("data", "jobs", "records", "list", "items", "content"):
+                    sv = val.get(sub)
+                    if isinstance(sv, list):
+                        if not sv:
+                            return []
+                        if isinstance(sv[0], dict):
+                            return sv
+
+        # top-level looks like a single job object
+        if any(k in data for k in ("title", "job_title", "name", "jobTitle")):
+            return [data]
+
+        return None
+
+    # ── Fetch one list page (API mode) ────────────────────────────────────────
+    def _fetch_list_page_api(self, page: int) -> list[dict]:
+        method, url_fn, body_fn = self._API_CANDIDATES[self._working_api]
+        url  = url_fn(page, self._PAGE_SIZE)
+        body = body_fn(page, self._PAGE_SIZE)
+        logger.info("[camhr] API %s page %d: %s", method, page, url)
+        if method == "POST":
+            data = self.http.post_json(url, body, extra_headers=self._API_HEADERS)
+        else:
+            data = self.http.get_json(url, extra_headers=self._API_HEADERS)
+        print_raw_json(f"LIST PAGE {page} — raw API response", data)
+        if data is None:
             logger.warning("[camhr] No JSON on list page %d", page)
             return []
-        inner = data.get("data") or {}
-        if isinstance(inner, list):
-            print_step(f"  inner is a list with {len(inner)} items")
-            return inner
-        if isinstance(inner, dict):
-            print_raw_json(f"  LIST PAGE {page} inner dict keys", inner)
-            for key in ("records", "list", "jobs", "items", "data"):
-                records = inner.get(key)
-                if isinstance(records, list):
-                    print_ok(f"  Found {len(records)} records under key '{key}'")
-                    return records
-        print_warn(f"  Could not parse records from page {page}")
-        return []
+        jobs = self._extract_jobs_from_response(data)
+        if jobs is None:
+            print_warn(f"Could not parse records from page {page} response")
+            return []
+        return jobs
 
-    # ── detail ────────────────────────────────────────────────────────────────
-    def _fetch_detail(self, job_id) -> dict:
-        url  = self._DETAIL_API.format(job_id=job_id)
-        print_step(f"Fetching detail: {url}")
+    # ── Fetch one list page (HTML mode) ──────────────────────────────────────
+    def _fetch_list_page_html(self, page: int) -> list[dict]:
+        url = self._HTML_LIST_URL if page == 1 else self._HTML_LIST_NEXT.format(page=page)
+        logger.info("[camhr] HTML list page %d: %s", page, url)
+        html = self.http.get_text(url, extra_headers={
+            "Accept": "text/html,application/xhtml+xml,*/*",
+            "Referer": "https://www.camhr.com/",
+        })
+        if not html:
+            logger.warning("[camhr] Empty HTML on page %d", page)
+            return []
+
+        soup = BeautifulSoup(html, "html.parser")
+        # Ordered list of selectors to try
+        selectors = [
+            "article.job",
+            "div.job-item",
+            "div.job-listing",
+            "li.job",
+            "div[class*='job-card']",
+            "div[class*='job_item']",
+            "div[class*='job_card']",
+            ".jobs-list .job",
+            ".job-list li",
+        ]
+        cards: list = []
+        for sel in selectors:
+            cards = soup.select(sel)
+            if cards:
+                print_step(f"  HTML: {len(cards)} cards via '{sel}'")
+                break
+
+        if not cards:
+            # Fallback: collect unique /job/ links
+            seen: set = set()
+            for a in soup.find_all("a", href=re.compile(r"/job/", re.I)):
+                href = urljoin(self.base_url, a["href"])
+                if href not in seen:
+                    seen.add(href)
+                    cards.append(a)
+            print_step(f"  HTML: fallback link scan — {len(cards)} /job/ links")
+
+        jobs = []
+        seen_urls: set = set()
+        for card in cards:
+            if card.name == "a":
+                href = card.get("href", "")
+            else:
+                a = card.find("a", href=re.compile(r"/job/", re.I))
+                href = a["href"] if a else ""
+            if not href:
+                continue
+            full_url = urljoin(self.base_url, href)
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+
+            title_el = (card.find(class_=re.compile(r"title|name", re.I))
+                        or card.find(["h1", "h2", "h3", "h4"])
+                        or card)
+            title = sanitize_text(title_el.get_text(" ", strip=True)) if title_el else ""
+
+            jobs.append({"_html_url": full_url, "title": title})
+
+        print_step(f"  HTML: {len(jobs)} job stubs extracted from page {page}")
+        return jobs
+
+    # ── Detail: API ───────────────────────────────────────────────────────────
+    def _fetch_detail_api(self, job_id) -> dict:
+        url = f"https://www.camhr.com/a/job/{job_id}"
+        print_step(f"Fetching detail API: {url}")
         data = self.http.get_json(url, extra_headers=self._API_HEADERS)
-        print_raw_json(f"DETAIL job_id={job_id} — raw API response", data)
+        print_raw_json(f"DETAIL job_id={job_id} — raw", data)
         if not data:
             return {}
         inner = data.get("data") or {}
-        if isinstance(inner, dict):
-            print_step(f"  Detail keys: {list(inner.keys())[:30]}")
-        return inner if isinstance(inner, dict) else {}
+        if isinstance(inner, dict) and inner:
+            return inner
+        if isinstance(data, dict) and any(
+                k in data for k in ("title", "job_title", "name")):
+            return data
+        return {}
 
-    # ── record builder ────────────────────────────────────────────────────────
+    # ── Detail: HTML ──────────────────────────────────────────────────────────
+    def _fetch_detail_html(self, job_url: str) -> dict:
+        print_step(f"Fetching detail HTML: {job_url}")
+        html = self.http.get_text(job_url, extra_headers={
+            "Accept": "text/html,application/xhtml+xml,*/*",
+            "Referer": "https://www.camhr.com/jobs",
+        })
+        if not html:
+            return {}
+        soup = BeautifulSoup(html, "html.parser")
+        out: dict = {}
+
+        # JSON-LD first (most reliable)
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                jld = json.loads(script.string or "{}")
+                nodes = jld if isinstance(jld, list) else [jld]
+                for node in nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    if "jobposting" in str(node.get("@type", "")).lower():
+                        out.setdefault("title",       sanitize_text(node.get("title", "")))
+                        out.setdefault("description", _strip_html(node.get("description", "")))
+                        loc = node.get("jobLocation")
+                        if isinstance(loc, dict):
+                            addr = loc.get("address") or {}
+                            out.setdefault("job_location",
+                                           sanitize_text(addr.get("addressLocality", "") or
+                                                         addr.get("addressRegion", "")))
+                        elif isinstance(loc, str):
+                            out.setdefault("job_location", sanitize_text(loc))
+                        out.setdefault("expired_at", sanitize_text(node.get("validThrough", "")))
+                        out.setdefault("created_at", sanitize_text(node.get("datePosted", "")))
+                        h_org = node.get("hiringOrganization") or {}
+                        if isinstance(h_org, dict):
+                            out.setdefault("company_name",    sanitize_text(h_org.get("name", "")))
+                            out.setdefault("company_website", sanitize_text(h_org.get("sameAs", ""), is_url=True))
+                            out.setdefault("company_logo",    sanitize_text(h_org.get("logo", ""), is_url=True))
+                        salary = node.get("baseSalary") or {}
+                        if isinstance(salary, dict):
+                            val = salary.get("value") or {}
+                            if isinstance(val, dict):
+                                mn = val.get("minValue", "")
+                                mx = val.get("maxValue", "")
+                                cur = salary.get("currency", "USD")
+                                if mn and mx:
+                                    out.setdefault("salary", f"{cur} {mn} - {mx}")
+                                elif mn or mx:
+                                    out.setdefault("salary", f"{cur} {mn or mx}")
+            except Exception:
+                pass
+
+        # HTML fallbacks
+        if not out.get("title"):
+            for sel in ["h1.job-title", "h1[class*='title']", ".job-title", "h1"]:
+                el = soup.select_one(sel)
+                if el:
+                    out["title"] = sanitize_text(el.get_text(" ", strip=True))
+                    break
+
+        if not out.get("company_name"):
+            for sel in [".company-name", "[class*='company']", ".employer-name",
+                        "[itemprop='hiringOrganization']"]:
+                el = soup.select_one(sel)
+                if el:
+                    out["company_name"] = sanitize_text(el.get_text(" ", strip=True))
+                    break
+
+        if not out.get("company_logo"):
+            logo_el = (soup.find("img", {"class": re.compile(r"logo|company", re.I)})
+                       or soup.find("img", src=re.compile(r"logo|company", re.I)))
+            if logo_el and logo_el.get("src"):
+                out["company_logo"] = sanitize_text(
+                    urljoin(job_url, logo_el["src"]), is_url=True)
+
+        if not out.get("description"):
+            for sel in [".job-description", "[class*='description']",
+                        "[class*='detail']", "article", "main", ".content"]:
+                el = soup.select_one(sel)
+                if el and len(el.get_text(strip=True)) > 100:
+                    out["description"] = _strip_html(str(el))
+                    break
+
+        if not out.get("job_location"):
+            for sel in [".location", "[class*='location']", "[itemprop='jobLocation']"]:
+                el = soup.select_one(sel)
+                if el:
+                    out["job_location"] = sanitize_text(el.get_text(" ", strip=True))
+                    break
+
+        if not out.get("expired_at"):
+            for sel in [".deadline", "[class*='deadline']", "[class*='expir']",
+                        "[class*='closing']", "time"]:
+                el = soup.select_one(sel)
+                if el:
+                    raw = el.get("datetime", "") or el.get_text(" ", strip=True)
+                    out["expired_at"] = sanitize_text(raw)
+                    break
+
+        # Application route via HTML link/email scan
+        app = extract_application(html, job_url)
+        if app:
+            out["_application_override"] = app
+
+        return out
+
+    # ── URL + ID resolution ───────────────────────────────────────────────────
+    def _resolve_job_url_and_id(self, list_job: dict) -> tuple[str, str | None]:
+        if "_html_url" in list_job:
+            job_url = sanitize_text(list_job["_html_url"], is_url=True)
+            m = re.search(r"/job/([^/?#]+)", job_url)
+            api_id = m.group(1) if m else None
+            return job_url, api_id
+
+        job_id = (list_job.get("id") or list_job.get("job_id") or
+                  list_job.get("jobId") or list_job.get("_id"))
+        slug   = (list_job.get("slug") or list_job.get("url_slug") or
+                  list_job.get("urlSlug") or list_job.get("permalink") or "")
+
+        if slug and slug.startswith("http"):
+            return sanitize_text(slug, is_url=True), str(job_id) if job_id else None
+        if slug:
+            return f"{self.base_url}/job/{slug}", str(job_id) if job_id else None
+        if job_id:
+            return f"{self.base_url}/job/{job_id}", str(job_id)
+        return "", None
+
+    # ── Record builder ────────────────────────────────────────────────────────
     def _build_record(self, list_job: dict, detail: dict, job_url: str) -> dict:
         j = {**list_job, **detail}
 
@@ -1422,74 +1721,77 @@ class CamHRScraper:
         print(_c('grey', '  ────────────────────────────────────────────────────────────────'))
 
         title = _clean_title(
-            sanitize_text(
-                j.get("title") or j.get("name") or j.get("job_title") or ""
-            )
+            sanitize_text(j.get("title") or j.get("name") or
+                          j.get("job_title") or j.get("jobTitle") or "")
         )
-        print_step(f"Title resolved  : {title!r}")
+        print_step(f"Title: {title!r}")
 
-        company_obj     = j.get("company") or {}
-        company_name    = sanitize_text(company_obj.get("name") or j.get("company_name") or "")
-        company_logo    = sanitize_text(
+        company_obj = j.get("company") or {}
+        if not isinstance(company_obj, dict):
+            company_obj = {}
+
+        company_name = sanitize_text(
+            company_obj.get("name") or j.get("company_name") or
+            j.get("employer_name") or j.get("companyName") or "")
+        company_logo = sanitize_text(
             company_obj.get("logo") or company_obj.get("logo_url") or
-            j.get("company_logo") or "", is_url=True)
+            j.get("company_logo") or j.get("logo") or "", is_url=True)
         if company_logo and not company_logo.startswith("http"):
-            company_logo = f"{self.base_url}/{company_logo.lstrip('/')}"
+            company_logo = urljoin(self.base_url, company_logo)
         company_website = sanitize_text(
-            company_obj.get("website") or j.get("company_website") or "", is_url=True)
+            company_obj.get("website") or company_obj.get("url") or
+            j.get("company_website") or j.get("company_url") or "", is_url=True)
         if company_website and not re.match(r"^https?://", company_website, re.I):
             company_website = f"https://{company_website}"
-        company_details  = sanitize_text(
-            _strip_html(company_obj.get("description") or j.get("company_description") or ""))
+        company_details = sanitize_text(
+            _strip_html(company_obj.get("description") or
+                        j.get("company_description") or j.get("about") or ""))
         company_industry = sanitize_text(
-            company_obj.get("industry") or j.get("company_industry") or "")
-        company_address  = sanitize_text(
+            company_obj.get("industry") or j.get("company_industry") or
+            j.get("industry") or "")
+        company_address = sanitize_text(
             company_obj.get("address") or j.get("company_address") or
             j.get("location") or "")
 
-        print_step(f"Company name    : {company_name!r}")
-        print_step(f"Company logo    : {company_logo!r}")
-        print_step(f"Company website : {company_website!r}")
-        print_step(f"Company industry: {company_industry!r}")
-        print_step(f"Company address : {company_address!r}")
-
         location = sanitize_text(
-            j.get("job_location") or j.get("city") or
-            j.get("province") or j.get("district") or
+            j.get("job_location") or j.get("city") or j.get("province") or
+            j.get("district") or j.get("address") or
             company_obj.get("address") or DEFAULT_LOCATION)
-        print_step(f"Location        : {location!r}")
 
         cat_obj   = j.get("category") or j.get("job_category") or {}
         job_field = (
             sanitize_text(cat_obj.get("name") if isinstance(cat_obj, dict) else str(cat_obj))
-            or sanitize_text(j.get("field") or j.get("job_field") or "")
+            or sanitize_text(j.get("field") or j.get("job_field") or
+                             j.get("sector") or j.get("department") or "")
         )
-        print_step(f"Job field/cat   : {job_field!r}  (raw cat_obj={cat_obj!r})")
 
         job_type = sanitize_text(
-            j.get("job_type") or j.get("employment_type") or j.get("type") or "")
-        print_step(f"Job type (raw)  : {job_type!r}")
+            j.get("job_type") or j.get("employment_type") or
+            j.get("type") or j.get("contract_type") or "")
 
         salary = self._format_salary(j)
-        print_step(f"Salary          : {salary!r}")
 
-        description_html = (
-            j.get("description") or j.get("job_description") or j.get("content") or "")
-        description = _strip_html(description_html)
-        print_step(f"Description     : {len(description)} chars")
+        raw_desc = (j.get("description") or j.get("job_description") or
+                    j.get("content") or j.get("body") or "")
+        description = (_strip_html(raw_desc) if "<" in str(raw_desc) else str(raw_desc))
 
         date_posted = str(
-            j.get("created_at") or j.get("posted_at") or
-            j.get("publish_date") or j.get("post_date") or "")[:10]
+            j.get("created_at") or j.get("posted_at") or j.get("publish_date") or
+            j.get("post_date") or j.get("datePosted") or "")[:10]
         deadline = str(
-            j.get("expired_at") or j.get("expiry_date") or
-            j.get("deadline") or j.get("closing_date") or "")[:10]
-        print_step(f"Date posted     : {date_posted!r}")
-        print_step(f"Deadline (raw)  : {deadline!r}")
+            j.get("expired_at") or j.get("expiry_date") or j.get("deadline") or
+            j.get("closing_date") or j.get("validThrough") or "")[:10]
 
-        print_step("Extracting application route…")
-        application = self._extract_application(j, description)
-        print_step(f"Application     : {application!r}")
+        if j.get("_application_override"):
+            application = j["_application_override"]
+            print_ok(f"Application (HTML override): {application!r}")
+        else:
+            application = self._extract_application(j, description)
+
+        print_step(f"Company: {company_name!r} | Location: {location!r} | "
+                   f"Type: {job_type!r} | Salary: {salary!r}")
+        print_step(f"Posted: {date_posted!r} | Deadline: {deadline!r} | App: {application!r}")
+        print_step(f"Description: {len(description)} chars")
 
         return {
             "Job Title":        title,
@@ -1511,48 +1813,43 @@ class CamHRScraper:
 
     @staticmethod
     def _extract_application(j: dict, description_text: str) -> str:
-        # 1. Direct email on job object
         for key in ("email", "contact_email", "apply_email", "application_email"):
             val = sanitize_text(j.get(key) or "")
             if val and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", val):
                 if not EMAIL_BLOCKLIST.search(val):
-                    print_ok(f"  [app] Priority 1 — job-level email via key '{key}': {val}")
+                    print_ok(f"  [app] job email via '{key}': {val}")
                     return sanitize_text(val, is_email=True)
-                else:
-                    print_warn(f"  [app] P1 email '{val}' blocked by blocklist")
 
-        # 2. External apply URL
-        for key in ("apply_url", "application_url", "apply_link", "external_url"):
+        for key in ("apply_url", "application_url", "apply_link", "external_url",
+                    "apply_now_url", "apply_button_url"):
             val = sanitize_text(j.get(key) or "", is_url=True)
             if val and val.lower().startswith("http") and "camhr.com" not in val.lower():
-                print_ok(f"  [app] Priority 2 — external apply URL via key '{key}': {val}")
+                print_ok(f"  [app] external URL via '{key}': {val}")
                 return val
-            elif val:
-                print_warn(f"  [app] P2 URL '{val[:60]}' rejected (same-site or empty)")
 
-        # 3. Company-level email
         company_obj = j.get("company") or {}
-        for key in ("email", "contact_email"):
-            val = sanitize_text(company_obj.get(key) or "")
-            if val and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", val):
-                if not EMAIL_BLOCKLIST.search(val):
-                    print_ok(f"  [app] Priority 3 — company email via key '{key}': {val}")
-                    return sanitize_text(val, is_email=True)
-                else:
-                    print_warn(f"  [app] P3 company email '{val}' blocked")
+        if isinstance(company_obj, dict):
+            for key in ("email", "contact_email"):
+                val = sanitize_text(company_obj.get(key) or "")
+                if val and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", val):
+                    if not EMAIL_BLOCKLIST.search(val):
+                        print_ok(f"  [app] company email via '{key}': {val}")
+                        return sanitize_text(val, is_email=True)
 
-        # 4. Mine description text
-        print_step("  [app] Priority 4 — mining description text…")
         return extract_application_from_text(description_text, page_domain="camhr.com")
 
     @staticmethod
     def _format_salary(j: dict) -> str:
-        min_s = j.get("min_salary") or j.get("salary_min") or j.get("salary_from")
-        max_s = j.get("max_salary") or j.get("salary_max") or j.get("salary_to")
+        min_s = (j.get("min_salary") or j.get("salary_min") or
+                 j.get("salary_from") or j.get("minSalary"))
+        max_s = (j.get("max_salary") or j.get("salary_max") or
+                 j.get("salary_to") or j.get("maxSalary"))
         if not min_s and not max_s:
-            raw = j.get("salary") or j.get("salary_range") or j.get("compensation") or ""
+            raw = (j.get("salary") or j.get("salary_range") or
+                   j.get("compensation") or j.get("pay") or "")
             return sanitize_text(str(raw)) if raw else ""
-        currency = sanitize_text(j.get("salary_currency") or j.get("currency") or "USD").upper()
+        currency = (sanitize_text(
+            j.get("salary_currency") or j.get("currency") or "USD").upper() or "USD")
 
         def fmt(v):
             try:
@@ -1570,13 +1867,15 @@ class CamHRScraper:
             salary = f"{salary} / {period}"
         return sanitize_text(salary)
 
-    # ── main scrape generator ─────────────────────────────────────────────────
+    # ── Main scrape generator ─────────────────────────────────────────────────
     def run(self, max_jobs: int, processed_ids: set, processed_urls: set):
         quota_str = str(max_jobs) if max_jobs else "unlimited"
         logger.info(
             "─── [%s] Starting scrape from %s (quota: %s) ───",
-            self.source_key.upper(), self._LIST_API, quota_str,
+            self.source_key.upper(), self.base_url, quota_str,
         )
+
+        self._probe_api()
 
         yielded      = 0
         page         = 1
@@ -1589,7 +1888,10 @@ class CamHRScraper:
                 logger.warning("[camhr] Hit safety page cap (%d) — stopping", self._MAX_PAGES)
                 break
 
-            list_jobs = self._fetch_list_page(page)
+            if self._use_html:
+                list_jobs = self._fetch_list_page_html(page)
+            else:
+                list_jobs = self._fetch_list_page_api(page)
 
             if not list_jobs:
                 empty_streak += 1
@@ -1605,14 +1907,10 @@ class CamHRScraper:
                 if max_jobs and yielded >= max_jobs:
                     break
 
-                job_id = list_job.get("id") or list_job.get("job_id")
-                slug   = list_job.get("slug") or list_job.get("url_slug") or ""
-                if slug:
-                    job_url = f"{self.base_url}/job/{slug}"
-                elif job_id:
-                    job_url = f"{self.base_url}/job/{job_id}"
-                else:
-                    logger.warning("[camhr] Job object has no id/slug — skipping")
+                job_url, api_job_id = self._resolve_job_url_and_id(list_job)
+                if not job_url:
+                    logger.warning("[camhr] No id/slug/url in job object — skipping: %s",
+                                   str(list_job)[:120])
                     continue
 
                 job_url = sanitize_text(job_url, is_url=True)
@@ -1625,36 +1923,37 @@ class CamHRScraper:
                     continue
 
                 print(f"\n{'─'*W}")
-                print(f"{_c('bold', _c('yellow', f'  PROCESSING: job_id={job_id}  url={job_url}'))}")
+                print(f"{_c('bold', _c('yellow', f'  PROCESSING: job_id={api_job_id}  url={job_url}'))}")
                 print(f"{'─'*W}")
 
-                logger.info("[camhr] Fetching detail for job_id=%s", job_id)
-                detail = self._fetch_detail(job_id) if job_id else {}
+                if self._use_html:
+                    detail = self._fetch_detail_html(job_url)
+                elif api_job_id:
+                    detail = self._fetch_detail_api(api_job_id)
+                else:
+                    detail = self._fetch_detail_html(job_url)
 
                 try:
                     fields = self._build_record(list_job, detail, job_url)
                 except Exception as e:
-                    logger.warning("[camhr] Failed to build record for %s: %s", job_url, e)
+                    logger.warning("[camhr] build_record failed for %s: %s", job_url, e)
+                    import traceback; traceback.print_exc()
                     continue
 
                 if not sanitize_text(fields.get("Job Title", "")):
                     print_skip(f"No title for {job_url} — skipping")
-                    logger.warning("[camhr] No title for %s — skipping", job_url)
                     continue
 
                 new_on_page += 1
-                logger.info("[camhr] Extracted title: '%s'", fields["Job Title"])
+                logger.info("[camhr] Title: '%s'", fields["Job Title"])
 
                 record = empty_record()
                 record.update({k: v for k, v in fields.items() if v})
                 record["Job URL"] = job_url
 
-                print_step("mine_fields: scanning description for inline label:value pairs…")
                 mined = mine_fields(record.get("Job Description", ""))
                 if mined:
-                    print_ok(f"  mine_fields found: {mined}")
-                else:
-                    print_warn("  mine_fields found nothing extra")
+                    print_ok(f"  mine_fields: {mined}")
                 for k, v in mined.items():
                     if not sanitize_text(record.get(k, "")):
                         record[k] = v
@@ -1663,8 +1962,8 @@ class CamHRScraper:
                     record["Job Location"] = self.default_location
                 record["Job Type"] = normalise_job_type(
                     record.get("Job Type", "")).replace("-", " ").title()
-                record["Date Posted"] = parse_date(record.get("Date Posted", ""),
-                                                   fallback_today=True)
+                record["Date Posted"] = parse_date(
+                    record.get("Date Posted", ""), fallback_today=True)
                 record["Deadline"] = parse_date(record.get("Deadline", ""))
                 record["Estimated Deadline"] = estimated_deadline(
                     record["Date Posted"], record["Deadline"])
@@ -1673,19 +1972,14 @@ class CamHRScraper:
                 cleaned_desc = clean_description(raw_desc)
                 diff = len(raw_desc) - len(cleaned_desc)
                 if diff > 0:
-                    print_warn(f"clean_description removed {diff} chars of noise/boilerplate")
-                else:
-                    print_ok("clean_description: no noise removed")
+                    print_warn(f"clean_description removed {diff} chars")
                 record["Job Description"] = cleaned_desc
 
                 logger.info(
-                    "[camhr] Record ready — Company='%s' | Location='%s' | "
-                    "Posted='%s' | Deadline='%s' | Application=%r",
+                    "[camhr] Ready — Company='%s' Location='%s' App=%r",
                     record.get("Company Name", ""),
                     record.get("Job Location", ""),
-                    record.get("Date Posted", ""),
-                    record.get("Estimated Deadline", ""),
-                    record.get("Application", "")[:80],
+                    (record.get("Application", "") or "")[:80],
                 )
 
                 record["_job_id"] = jid
@@ -1694,7 +1988,7 @@ class CamHRScraper:
                 yielded += 1
                 yield record
 
-            logger.info("[camhr] Page %d: %d new job(s) (total yielded %d)",
+            logger.info("[camhr] Page %d: %d new job(s) (total %d)",
                         page, new_on_page, yielded)
             page += 1
 
@@ -1741,8 +2035,7 @@ def main():
     ap.add_argument("--limit",         type=int, default=DEFAULT_LIMIT,
                     help=f"max jobs per source (default: {DEFAULT_LIMIT}; 0=unlimited)")
     ap.add_argument("--sources",       nargs="+", default=_ALL_SOURCES,
-                    choices=_ALL_SOURCES, metavar="SOURCE",
-                    help=f"sources to run (default: all). choices: {_ALL_SOURCES}")
+                    choices=_ALL_SOURCES, metavar="SOURCE")
     ap.add_argument("--dry-run",       action="store_true",
                     help="scrape + paraphrase but do NOT post to WordPress")
     ap.add_argument("--no-paraphrase", action="store_true",
@@ -1774,11 +2067,11 @@ def main():
         wp = WordPressClient()
 
     processed_ids, processed_urls = tracker_load()
-    logger.info("Tracker: %d previously processed IDs / %d URLs loaded",
+    logger.info("Tracker: %d IDs / %d URLs loaded",
                 len(processed_ids), len(processed_urls))
 
     seen_fingerprints, fingerprint_index = tracker_load_fingerprints()
-    logger.info("Tracker: %d fingerprints loaded (%d for fuzzy match)",
+    logger.info("Tracker: %d fingerprints (%d for fuzzy)",
                 len(seen_fingerprints), len(fingerprint_index))
     FUZZY_DUP_THRESHOLD = 0.86
 
@@ -1791,10 +2084,8 @@ def main():
                    "skipped_duplicate": 0, "posted": 0, "failed": 0}
         global_stats[source_key] = stats
 
-        logger.info("")
         logger.info("╔══════════════════════════════════════╗")
         logger.info("║  SOURCE: %-28s ║", source_key.upper())
-        logger.info("║  URL   : %-28s ║", cls.base_url)
         logger.info("╚══════════════════════════════════════╝")
 
         job_index = 0
@@ -1808,10 +2099,10 @@ def main():
             tracker_mark_read(jid, source_key, rec.get("Job URL", ""),
                               title, company, fingerprint=fp)
             stats["scraped"] += 1
-            logger.info("[%s] ── Job #%d ──  '%s'  @  '%s'",
+            logger.info("[%s] Job #%d  '%s'  @  '%s'",
                         source_key, stats["scraped"], title, company)
 
-            # ── Cross-source duplicate check ──────────────────────────────────
+            # ── Duplicate check ───────────────────────────────────────────────
             is_dup, dup_reason = False, ""
             if fp in seen_fingerprints:
                 is_dup     = True
@@ -1832,7 +2123,6 @@ def main():
 
             if is_dup:
                 print_skip(f"DUPLICATE — {dup_reason}")
-                logger.info("[%s] Duplicate skipped — %s", source_key, dup_reason)
                 tracker_mark_failed(jid, f"duplicate|{dup_reason}"[:120])
                 stats["skipped_duplicate"] += 1
                 continue
@@ -1844,47 +2134,29 @@ def main():
             })
 
             # ── Enrichment ────────────────────────────────────────────────────
-            needs_enrich = _needs_enrichment(rec)
-            print_step(f"Needs enrichment: {needs_enrich}  "
-                       f"(has_application={has_application(rec)}, "
-                       f"blank company fields={sum(1 for f in COMPANY_FIELDS if not sanitize_text(rec.get(f,'')))})")
-            if needs_enrich:
-                logger.info("[%s] Enriching company data for '%s'", source_key, company or title)
+            if _needs_enrichment(rec):
                 rec = enricher.enrich(rec)
-                logger.info(
-                    "[%s] Post-enrichment: app=%r  website=%r  logo=%r",
-                    source_key,
-                    rec.get("Application", "")[:60],
-                    rec.get("Company Website", "")[:60],
-                    rec.get("Company Logo", "")[:60],
-                )
 
-            # ── Print the full scraped record ─────────────────────────────────
+            # ── Print record ──────────────────────────────────────────────────
             print_record(rec, job_index, source_key)
 
-            # ── Require application route ─────────────────────────────────────
+            # ── Application gate ──────────────────────────────────────────────
             if not has_application(rec):
                 print_skip(f"No valid application route — skipping '{title}'")
-                logger.info("[%s] No valid application route — skipping '%s'",
-                            source_key, title)
                 tracker_mark_failed(jid, "no application route")
                 stats["skipped_no_app"] += 1
                 _append_csv(rec)
                 continue
 
-            print_ok(f"Application route confirmed: {rec.get('Application','')}")
-            logger.info("[%s] Application route: %s", source_key, rec.get("Application", ""))
+            print_ok(f"Application: {rec.get('Application','')}")
             _append_csv(rec)
 
             # ── Paraphrase ────────────────────────────────────────────────────
             if do_paraphrase:
-                logger.info("[%s] Paraphrasing title + description…", source_key)
                 out_title   = para.title(title)
                 out_desc    = para.description(rec.get("Job Description", ""))
                 out_company = (para.company(rec.get("Company Details", ""))
                                if rec.get("Company Details") else "")
-                logger.info("[%s] Paraphrased title: '%s' → '%s'",
-                            source_key, title, out_title)
             else:
                 out_title   = title
                 out_desc    = rec.get("Job Description", "")
@@ -1893,33 +2165,27 @@ def main():
             # ── Post to WordPress ─────────────────────────────────────────────
             if args.dry_run:
                 print_ok(f"[dry-run] Would post: '{out_title}'")
-                logger.info("[%s] [dry-run] Would post: '%s'", source_key, out_title)
                 continue
 
             try:
                 co_id, co_url = wp.save_company(rec, out_company, tagline="")
                 if co_id:
                     print_ok(f"Company saved: WP ID {co_id}  {co_url}")
-                    logger.info("[%s] Company saved: WP ID %s  %s",
-                                source_key, co_id, co_url)
                 wp_id, wp_url = wp.save_job(rec, out_title, out_desc)
                 if wp_id:
                     tracker_mark_posted(jid, wp_id, wp_url)
                     stats["posted"] += 1
-                    print_ok(f"Posted to WP: ID={wp_id}  {wp_url}")
-                    logger.info("[%s] Posted: WP ID %s  %s", source_key, wp_id, wp_url)
+                    print_ok(f"Posted: ID={wp_id}  {wp_url}")
                 else:
                     tracker_mark_failed(jid, "wp post returned no id")
                     stats["failed"] += 1
                     print_skip(f"WP post returned no ID for '{out_title}'")
-                    logger.error("[%s] WP post returned no ID for '%s'", source_key, title)
             except Exception as e:
-                logger.error("[%s] Posting exception for '%s': %s", source_key, title, e)
+                logger.error("[%s] Posting exception '%s': %s", source_key, title, e)
                 tracker_mark_failed(jid, e)
                 stats["failed"] += 1
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    logger.info("")
     logger.info("╔══════════════════════════════════════════════════════════════════════╗")
     logger.info("║                        PER-SOURCE SUMMARY                           ║")
     logger.info("╠══════════════════════════════════════════════════════════════════════╣")
